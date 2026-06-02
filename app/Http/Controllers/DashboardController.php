@@ -3,7 +3,6 @@
 namespace App\Http\Controllers;
 
 use Illuminate\Http\Request;
-use App\Models\Transaction;
 use Carbon\Carbon;
 use Illuminate\Support\Facades\Http;
 use Barryvdh\DomPDF\Facade\Pdf;
@@ -11,9 +10,18 @@ use Maatwebsite\Excel\Facades\Excel;
 
 class DashboardController extends Controller
 {
-    // Properti Endpoint API untuk memangkas duplikasi string URL
-    private $apiUrl = "https://sixties-pout-envoy.ngrok-free.dev/api";
-    private $capId = "6a1aaad36e2bd186d80b0e5d";
+    /**
+     * Endpoint API utama.
+     * Ganti URL ini jika endpoint ngrok/API kamu berubah.
+     */
+    private string $apiUrl = "https://sixties-pout-envoy.ngrok-free.dev/api";
+
+    /**
+     * Fallback ID lama.
+     * Hanya dipakai kalau API belum bisa mengambil capacity berdasarkan tanggal hari ini.
+     * Kalau endpoint daily capacity sudah benar-benar tersedia, boleh dihapus.
+     */
+    private ?string $fallbackCapId = "6a1aaad36e2bd186d80b0e5d";
 
     public function index()
     {
@@ -21,18 +29,20 @@ class DashboardController extends Controller
         $capacity = 120;
         $occupancyPct = 0;
 
-        try {
-            $response = Http::get("{$this->apiUrl}/capacity/{$this->capId}");
-            if ($response->successful() && isset($response->json()['success']) && $response->json()['success']) {
-                $capacity = (int) $response->json()['kapasitas_maksimal'];
-            }
-        } catch (\Exception $e) {
+        // Ambil kapasitas berdasarkan tanggal hari ini, bukan berdasarkan ID hardcode.
+        $todayCapacity = $this->getTodayCapacity();
+
+        if ($todayCapacity && isset($todayCapacity['kapasitas_maksimal'])) {
+            $capacity = (int) $todayCapacity['kapasitas_maksimal'];
         }
 
-        // Menggabungkan request pagination API menggunakan refaktorisasi helper internal
+        // Menggabungkan request pagination API menggunakan helper internal.
         $allTransactions = $this->fetchAllTransactions(3);
 
-        $totalRevenue = $allTransactions->filter(fn($tx) => $tx['status_pembayaran'] == 'paid')->sum('total_harga');
+        $totalRevenue = $allTransactions
+            ->filter(fn ($tx) => ($tx['status_pembayaran'] ?? null) === 'paid')
+            ->sum('total_harga');
+
         $totalVisitors = $allTransactions
             ->where('status_pembayaran', 'paid')
             ->count();
@@ -40,28 +50,45 @@ class DashboardController extends Controller
         // =============================
         // HITUNG DATA HARI INI
         // =============================
-        $todayTransactions = $allTransactions->filter(fn($tx) => Carbon::parse($tx['created_at'])->toDateString() == $today);
-        $revenueToday = $todayTransactions->where('status_pembayaran', 'paid')->sum('total_harga');
+        $todayTransactions = $allTransactions->filter(function ($tx) use ($today) {
+            return isset($tx['created_at']) && Carbon::parse($tx['created_at'])->toDateString() === $today;
+        });
+
+        $revenueToday = $todayTransactions
+            ->where('status_pembayaran', 'paid')
+            ->sum('total_harga');
+
         $ticketSold = $todayTransactions->sum(function ($tx) {
             return collect($tx['details'] ?? [])
                 ->whereIn('status_ticket', ['aktif', 'digunakan'])
                 ->count();
         });
+
         $visitorToday = $todayTransactions
             ->where('status_pembayaran', 'paid')
             ->count();
 
-        $occupancyPct = $capacity > 0 ? min(100, round(($visitorToday / $capacity) * 100)) : 0;
+        $occupancyPct = $capacity > 0
+            ? min(100, round(($visitorToday / $capacity) * 100))
+            : 0;
 
         // =============================
         // GRAFIK 7 HARI
         // =============================
         $chartData = [];
+
         for ($i = 6; $i >= 0; $i--) {
             $date = Carbon::today()->subDays($i);
+
             $chartData[] = [
                 'label' => $date->locale('id')->isoFormat('ddd'),
-                'value' => $allTransactions->filter(fn($tx) => Carbon::parse($tx['created_at'])->toDateString() == $date->toDateString() && $tx['status_pembayaran'] == 'paid')->sum('total_harga')
+                'value' => $allTransactions
+                    ->filter(function ($tx) use ($date) {
+                        return isset($tx['created_at'])
+                            && Carbon::parse($tx['created_at'])->toDateString() === $date->toDateString()
+                            && ($tx['status_pembayaran'] ?? null) === 'paid';
+                    })
+                    ->sum('total_harga'),
             ];
         }
 
@@ -71,15 +98,13 @@ class DashboardController extends Controller
         $recentTransactions = collect();
 
         foreach ($allTransactions as $tx) {
-
             foreach (($tx['details'] ?? []) as $detail) {
-
                 $recentTransactions->push((object) [
-                    'user_name' => $tx['nama_customer'],
+                    'user_name' => $tx['nama_customer'] ?? '-',
                     'package_name' => $detail['nama_paket'] ?? '-',
-                    'total' => $tx['total_harga'],
+                    'total' => $tx['total_harga'] ?? 0,
                     'status' => $detail['status_ticket'] ?? 'paid',
-                    'created_at' => $tx['created_at'],
+                    'created_at' => $tx['created_at'] ?? null,
                 ]);
             }
         }
@@ -88,19 +113,68 @@ class DashboardController extends Controller
             ->sortByDesc('created_at')
             ->take(4);
 
-        return view('dashboard.index', compact('revenueToday', 'visitorToday', 'ticketSold', 'occupancyPct', 'capacity', 'chartData', 'recentTransactions', 'totalRevenue', 'totalVisitors'));
+        return view('dashboard.index', compact(
+            'revenueToday',
+            'visitorToday',
+            'ticketSold',
+            'occupancyPct',
+            'capacity',
+            'chartData',
+            'recentTransactions',
+            'totalRevenue',
+            'totalVisitors'
+        ));
     }
 
     public function updateCapacity(Request $request)
     {
-        $request->validate(['kapasitas_maksimal' => 'required|integer|min:1']);
+        $request->validate([
+            'kapasitas_maksimal' => 'required|integer|min:1',
+        ]);
+
         try {
-            $response = Http::withHeaders(['Accept' => 'application/json'])->put("{$this->apiUrl}/capacity/update/{$this->capId}", [
-                'kapasitas_maksimal' => (int) $request->kapasitas_maksimal
+            // Ambil data kapasitas hari ini supaya ID yang di-update sesuai dengan data hari ini.
+            $todayCapacity = $this->getTodayCapacity();
+
+            if (!$todayCapacity) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Data kapasitas hari ini tidak ditemukan. Pastikan API menyediakan endpoint capacity berdasarkan tanggal hari ini.',
+                ], 404);
+            }
+
+            $capacityId = $this->resolveCapacityId($todayCapacity);
+
+            if (!$capacityId) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'ID kapasitas hari ini tidak ditemukan pada response API.',
+                ], 422);
+            }
+
+            $response = Http::withHeaders([
+                'Accept' => 'application/json',
+            ])->put("{$this->apiUrl}/capacity/update/{$capacityId}", [
+                'kapasitas_maksimal' => (int) $request->kapasitas_maksimal,
             ]);
-            return response()->json(['success' => $response->successful(), 'message' => $response->successful() ? null : $response->body()], $response->successful() ? 200 : 500);
+
+            if (!$response->successful()) {
+                return response()->json([
+                    'success' => false,
+                    'message' => $response->body(),
+                ], 500);
+            }
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Kapasitas hari ini berhasil diperbarui.',
+                'data' => $response->json(),
+            ]);
         } catch (\Exception $e) {
-            return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
+            return response()->json([
+                'success' => false,
+                'message' => $e->getMessage(),
+            ], 500);
         }
     }
 
@@ -113,6 +187,10 @@ class DashboardController extends Controller
 
         if ($from && $to) {
             $transactions = $transactions->filter(function ($tx) use ($from, $to) {
+                if (!isset($tx['created_at'])) {
+                    return false;
+                }
+
                 $date = Carbon::parse($tx['created_at'])->toDateString();
 
                 return $date >= $from && $date <= $to;
@@ -129,7 +207,6 @@ class DashboardController extends Controller
                 ->count();
         });
 
-
         return response()->json([
             'revenue' => $totalRevenue,
             'visitors' => $totalVisitors,
@@ -140,32 +217,190 @@ class DashboardController extends Controller
     {
         $from = $request->from;
         $to = $request->to;
-        $transactions = $this->fetchAllTransactions()->filter(fn($tx) => ($d = Carbon::parse($tx['created_at'])->toDateString()) >= $from && $d <= $to);
-        return Pdf::loadView('exports.transactions_pdf', compact('transactions', 'from', 'to'))->download('laporan-transaksi.pdf');
+
+        $transactions = $this->fetchAllTransactions()->filter(function ($tx) use ($from, $to) {
+            if (!isset($tx['created_at'])) {
+                return false;
+            }
+
+            $date = Carbon::parse($tx['created_at'])->toDateString();
+
+            return $date >= $from && $date <= $to;
+        });
+
+        return Pdf::loadView('exports.transactions_pdf', compact('transactions', 'from', 'to'))
+            ->download('laporan-transaksi.pdf');
     }
 
     public function exportExcel(Request $request)
     {
         $from = $request->from;
         $to = $request->to;
-        $transactions = $this->fetchAllTransactions()->filter(fn($tx) => ($d = Carbon::parse($tx['created_at'])->toDateString()) >= $from && $d <= $to);
-        return Excel::download(new \App\Exports\TransactionExport($transactions, $from, $to), 'laporan-transaksi.xlsx');
+
+        $transactions = $this->fetchAllTransactions()->filter(function ($tx) use ($from, $to) {
+            if (!isset($tx['created_at'])) {
+                return false;
+            }
+
+            $date = Carbon::parse($tx['created_at'])->toDateString();
+
+            return $date >= $from && $date <= $to;
+        });
+
+        return Excel::download(
+            new \App\Exports\TransactionExport($transactions, $from, $to),
+            'laporan-transaksi.xlsx'
+        );
     }
 
-    // HELPER METHOD: Sentralisasi perulangan HTTP Client (Don't Repeat Yourself)
+    /**
+     * Ambil data capacity/time_slot untuk tanggal hari ini.
+     *
+     * Catatan:
+     * - Fungsi ini mencoba beberapa pola endpoint supaya lebih fleksibel.
+     * - Kalau API kamu hanya punya satu endpoint khusus, boleh sisakan endpoint yang sesuai saja.
+     */
+    private function getTodayCapacity(): ?array
+    {
+        $today = Carbon::today()->toDateString();
+
+        $endpointCandidates = [
+            [
+                'url' => "{$this->apiUrl}/capacity/today",
+                'query' => ['tanggal' => $today],
+            ],
+            [
+                'url' => "{$this->apiUrl}/capacity/today",
+                'query' => ['date' => $today],
+            ],
+            [
+                'url' => "{$this->apiUrl}/capacity/by-date/{$today}",
+                'query' => [],
+            ],
+            [
+                'url' => "{$this->apiUrl}/capacity",
+                'query' => ['tanggal' => $today],
+            ],
+            [
+                'url' => "{$this->apiUrl}/capacity",
+                'query' => ['date' => $today],
+            ],
+        ];
+
+        foreach ($endpointCandidates as $endpoint) {
+            try {
+                $response = Http::timeout(10)->get($endpoint['url'], $endpoint['query']);
+
+                if (!$response->successful()) {
+                    continue;
+                }
+
+                $capacity = $this->normalizeCapacityResponse($response->json());
+
+                if ($capacity) {
+                    return $capacity;
+                }
+            } catch (\Exception $e) {
+                continue;
+            }
+        }
+
+        /**
+         * Fallback supaya dashboard tetap tampil kalau endpoint daily capacity belum tersedia.
+         * Namun untuk update per hari, sebaiknya tetap gunakan endpoint berdasarkan tanggal.
+         */
+        if ($this->fallbackCapId) {
+            try {
+                $response = Http::timeout(10)->get("{$this->apiUrl}/capacity/{$this->fallbackCapId}");
+
+                if ($response->successful()) {
+                    return $this->normalizeCapacityResponse($response->json());
+                }
+            } catch (\Exception $e) {
+                return null;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Menyamakan bentuk response API menjadi array capacity langsung.
+     * Mendukung beberapa bentuk response umum:
+     * - { success: true, data: {...} }
+     * - { data: {...} }
+     * - { capacity: {...} }
+     * - { _id: ..., kapasitas_maksimal: ... }
+     */
+    private function normalizeCapacityResponse(?array $json): ?array
+    {
+        if (!$json) {
+            return null;
+        }
+
+        if (isset($json['data']) && is_array($json['data'])) {
+            // Kalau data berupa list, ambil item pertama.
+            if (array_is_list($json['data'])) {
+                return $json['data'][0] ?? null;
+            }
+
+            return $json['data'];
+        }
+
+        if (isset($json['capacity']) && is_array($json['capacity'])) {
+            return $json['capacity'];
+        }
+
+        if (isset($json['time_slot']) && is_array($json['time_slot'])) {
+            return $json['time_slot'];
+        }
+
+        if (isset($json['kapasitas_maksimal'])) {
+            return $json;
+        }
+
+        return null;
+    }
+
+    /**
+     * Ambil ID capacity dari beberapa kemungkinan nama field.
+     */
+    private function resolveCapacityId(array $capacity): ?string
+    {
+        return $capacity['_id']
+            ?? $capacity['id']
+            ?? $capacity['capacity_id']
+            ?? $capacity['id_capacity']
+            ?? $capacity['time_slot_id']
+            ?? $capacity['id_time_slot']
+            ?? null;
+    }
+
+    /**
+     * Helper method: sentralisasi perulangan HTTP Client.
+     */
     private function fetchAllTransactions($maxPage = null)
     {
         $page = 1;
         $allData = collect();
-        do {
-            $response = Http::timeout(10)->get("{$this->apiUrl}/transactions", ['page' => $page]);
-            if (!$response->successful())
-                break;
 
-            $json = $response->json();
-            $allData = $allData->merge($json['data'] ?? []);
-            $lastPage = $json['last_page'] ?? 1;
-            $page++;
+        do {
+            try {
+                $response = Http::timeout(10)->get("{$this->apiUrl}/transactions", [
+                    'page' => $page,
+                ]);
+
+                if (!$response->successful()) {
+                    break;
+                }
+
+                $json = $response->json();
+                $allData = $allData->merge($json['data'] ?? []);
+                $lastPage = $json['last_page'] ?? 1;
+                $page++;
+            } catch (\Exception $e) {
+                break;
+            }
         } while ($page <= $lastPage && ($maxPage === null || $page <= $maxPage));
 
         return $allData;
