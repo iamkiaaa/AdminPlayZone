@@ -112,7 +112,8 @@
       </div>
     </div>
   </div>
-  <script src="{{ asset('js/playzone.js') }}"></script>
+  <link rel="stylesheet" href="http://admin-play-zone.up.railway.app/css/playzone.css">
+  <script src="http://admin-play-zone.up.railway.app/js/playzone.js"></script>
   @stack('scripts')
 </body>
 
