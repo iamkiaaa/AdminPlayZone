@@ -129,51 +129,75 @@ class DashboardController extends Controller
     public function updateCapacity(Request $request)
     {
         $request->validate([
-            'kapasitas_maksimal' => 'required|integer|min:1',
+            'kapasitas_maksimal' => 'required|integer|min:1'
         ]);
 
         try {
-            // Ambil data kapasitas hari ini supaya ID yang di-update sesuai dengan data hari ini.
-            $todayCapacity = $this->getTodayCapacity();
+            // 1. Ambil slot hari ini dari API
+            $slotResponse = Http::timeout(10)
+                ->withHeaders(['Accept' => 'application/json'])
+                ->get("{$this->apiUrl}/slots/today");
 
-            if (!$todayCapacity) {
+            if (!$slotResponse->successful()) {
                 return response()->json([
                     'success' => false,
-                    'message' => 'Data kapasitas hari ini tidak ditemukan. Pastikan API menyediakan endpoint capacity berdasarkan tanggal hari ini.',
-                ], 404);
-            }
-
-            $capacityId = $this->resolveCapacityId($todayCapacity);
-
-            if (!$capacityId) {
-                return response()->json([
-                    'success' => false,
-                    'message' => 'ID kapasitas hari ini tidak ditemukan pada response API.',
-                ], 422);
-            }
-
-            $response = Http::withHeaders([
-                'Accept' => 'application/json',
-            ])->put("{$this->apiUrl}/capacity/update/{$capacityId}", [
-                'kapasitas_maksimal' => (int) $request->kapasitas_maksimal,
-            ]);
-
-            if (!$response->successful()) {
-                return response()->json([
-                    'success' => false,
-                    'message' => $response->body(),
+                    'message' => 'Gagal mengambil slot hari ini dari API.',
+                    'status' => $slotResponse->status(),
+                    'body' => $slotResponse->body(),
                 ], 500);
             }
 
+            $json = $slotResponse->json();
+
+            // 2. Baca kemungkinan bentuk response API
+            $slot = $json['data'] 
+                ?? $json['slot'] 
+                ?? $json['time_slot'] 
+                ?? $json;
+
+            $slotId = $slot['_id'] 
+                ?? $slot['id'] 
+                ?? $slot['id_time_slot'] 
+                ?? null;
+
+            if (!$slotId) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'ID slot hari ini tidak ditemukan dari response /slots/today.',
+                    'response_slots_today' => $json,
+                ], 500);
+            }
+
+            // 3. Update kapasitas berdasarkan ID slot hari ini
+            $updateResponse = Http::timeout(10)
+                ->withHeaders(['Accept' => 'application/json'])
+                ->put("{$this->apiUrl}/capacity/update/{$slotId}", [
+                    'kapasitas_maksimal' => (int) $request->kapasitas_maksimal
+                ]);
+
+            if (!$updateResponse->successful()) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'API gagal update kapasitas.',
+                    'slot_id' => $slotId,
+                    'status' => $updateResponse->status(),
+                    'body' => $updateResponse->body(),
+                ], 500);
+            }
+
+            $updateJson = $updateResponse->json();
+
             return response()->json([
-                'success' => true,
-                'message' => 'Kapasitas hari ini berhasil diperbarui.',
-                'data' => $response->json(),
+                'success' => $updateJson['success'] ?? true,
+                'message' => $updateJson['message'] ?? 'Kapasitas berhasil diperbarui.',
+                'slot_id' => $slotId,
+                'api_response' => $updateJson,
             ]);
+
         } catch (\Exception $e) {
             return response()->json([
                 'success' => false,
-                'message' => $e->getMessage(),
+                'message' => 'Terjadi error di admin: ' . $e->getMessage(),
             ], 500);
         }
     }
