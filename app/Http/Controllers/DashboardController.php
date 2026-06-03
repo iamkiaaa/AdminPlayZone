@@ -3,47 +3,62 @@
 namespace App\Http\Controllers;
 
 use Illuminate\Http\Request;
+use App\Models\Transaction;
 use Carbon\Carbon;
 use Illuminate\Support\Facades\Http;
-use Illuminate\Support\Facades\Log;
 use Barryvdh\DomPDF\Facade\Pdf;
 use Maatwebsite\Excel\Facades\Excel;
 
 class DashboardController extends Controller
 {
-    private string $apiUrl = "https://sixties-pout-envoy.ngrok-free.dev/api";
+    /**
+     * Endpoint API utama.
+     * Sesuaikan kalau URL API berubah.
+     */
+    private $apiUrl = "https://sixties-pout-envoy.ngrok-free.dev/api";
 
     public function index()
     {
-        $today = Carbon::today()->toDateString();
+        $today = Carbon::today('Asia/Jakarta')->toDateString();
         $capacity = 120;
         $occupancyPct = 0;
 
+        // =====================================================
+        // AMBIL KAPASITAS HARI INI DARI /slots/today
+        // =====================================================
         try {
-            $todaySlot = $this->getTodaySlotWithDebug();
-            $slot = $todaySlot['slot'] ?? null;
+            $todaySlot = $this->getTodaySlot();
 
-            if (is_array($slot)) {
-                $capacity = (int) ($slot['kapasitas_maksimal'] ?? 120);
+            if ($todaySlot) {
+                $capacity = (int) (
+                    $todaySlot['kapasitas_maksimal']
+                    ?? $todaySlot['capacity']
+                    ?? $todaySlot['max_capacity']
+                    ?? 120
+                );
             }
         } catch (\Exception $e) {
-            Log::error('Gagal mengambil kapasitas hari ini', [
-                'error' => $e->getMessage(),
-            ]);
+            $capacity = 120;
         }
 
+        // =====================================================
+        // TRANSAKSI
+        // =====================================================
         $allTransactions = $this->fetchAllTransactions(3);
 
         $totalRevenue = $allTransactions
-            ->filter(fn ($tx) => ($tx['status_pembayaran'] ?? null) === 'paid')
+            ->filter(fn ($tx) => ($tx['status_pembayaran'] ?? null) == 'paid')
             ->sum('total_harga');
 
         $totalVisitors = $allTransactions
             ->where('status_pembayaran', 'paid')
             ->count();
 
+        // =====================================================
+        // HITUNG DATA HARI INI
+        // =====================================================
         $todayTransactions = $allTransactions->filter(function ($tx) use ($today) {
-            return isset($tx['created_at']) && Carbon::parse($tx['created_at'])->toDateString() === $today;
+            return isset($tx['created_at']) && Carbon::parse($tx['created_at'])->toDateString() == $today;
         });
 
         $revenueToday = $todayTransactions
@@ -64,21 +79,29 @@ class DashboardController extends Controller
             ? min(100, round(($visitorToday / $capacity) * 100))
             : 0;
 
+        // =====================================================
+        // GRAFIK 7 HARI
+        // =====================================================
         $chartData = [];
+
         for ($i = 6; $i >= 0; $i--) {
-            $date = Carbon::today()->subDays($i);
+            $date = Carbon::today('Asia/Jakarta')->subDays($i);
+
             $chartData[] = [
                 'label' => $date->locale('id')->isoFormat('ddd'),
                 'value' => $allTransactions
                     ->filter(function ($tx) use ($date) {
                         return isset($tx['created_at'])
-                            && Carbon::parse($tx['created_at'])->toDateString() === $date->toDateString()
-                            && ($tx['status_pembayaran'] ?? null) === 'paid';
+                            && Carbon::parse($tx['created_at'])->toDateString() == $date->toDateString()
+                            && ($tx['status_pembayaran'] ?? null) == 'paid';
                     })
-                    ->sum('total_harga'),
+                    ->sum('total_harga')
             ];
         }
 
+        // =====================================================
+        // TRANSAKSI TERBARU
+        // =====================================================
         $recentTransactions = collect();
 
         foreach ($allTransactions as $tx) {
@@ -88,7 +111,7 @@ class DashboardController extends Controller
                     'package_name' => $detail['nama_paket'] ?? '-',
                     'total' => $tx['total_harga'] ?? 0,
                     'status' => $detail['status_ticket'] ?? 'paid',
-                    'created_at' => $tx['created_at'] ?? now(),
+                    'created_at' => $tx['created_at'] ?? null,
                 ]);
             }
         }
@@ -110,111 +133,67 @@ class DashboardController extends Controller
         ));
     }
 
+    /**
+     * Update kapasitas dari admin.
+     * Alur:
+     * 1. Ambil slot hari ini dari GET /api/slots/today
+     * 2. Ambil ID slot dari response API
+     * 3. Update kapasitas ke PUT /api/capacity/update/{id}
+     */
     public function updateCapacity(Request $request)
     {
         $request->validate([
-            'kapasitas_maksimal' => 'required|integer|min:1',
+            'kapasitas_maksimal' => 'required|integer|min:1'
         ]);
 
         try {
-            $todaySlotResult = $this->getTodaySlotWithDebug();
+            $todaySlot = $this->getTodaySlot();
 
-            if (!$todaySlotResult['success']) {
+            if (!$todaySlot) {
                 return response()->json([
                     'success' => false,
-                    'message' => $todaySlotResult['message'],
-                    'debug' => $todaySlotResult,
-                ], 500);
+                    'message' => 'Data slot hari ini tidak ditemukan dari API /slots/today.'
+                ], 404);
             }
 
-            $slot = $todaySlotResult['slot'];
-            $slotId = $this->extractSlotId($slot);
+            $slotId = $this->extractSlotId($todaySlot);
 
             if (!$slotId) {
                 return response()->json([
                     'success' => false,
-                    'message' => 'ID slot hari ini tidak ditemukan dari response /slots/today.',
-                    'debug' => [
-                        'api_url' => "{$this->apiUrl}/slots/today",
-                        'slot_response' => $todaySlotResult,
-                    ],
+                    'message' => 'ID slot hari ini tidak ditemukan dari response API.',
+                    'response' => $todaySlot
                 ], 500);
             }
 
-            $updateUrl = "{$this->apiUrl}/capacity/update/{$slotId}";
-
-            $updateResponse = Http::timeout(20)
-                ->withHeaders([
-                    'Accept' => 'application/json',
-                    'Content-Type' => 'application/json',
-                ])
-                ->put($updateUrl, [
-                    'kapasitas_maksimal' => (int) $request->kapasitas_maksimal,
+            $response = Http::timeout(10)
+                ->withHeaders(['Accept' => 'application/json'])
+                ->put("{$this->apiUrl}/capacity/update/{$slotId}", [
+                    'kapasitas_maksimal' => (int) $request->kapasitas_maksimal
                 ]);
 
-            $bodyText = $updateResponse->body();
-            $bodyJson = null;
-
-            try {
-                $bodyJson = $updateResponse->json();
-            } catch (\Exception $e) {
-                $bodyJson = null;
-            }
-
-            Log::info('Update kapasitas response', [
-                'update_url' => $updateUrl,
-                'slot_id' => $slotId,
-                'status' => $updateResponse->status(),
-                'body' => $bodyText,
-            ]);
-
-            if (!$updateResponse->successful()) {
+            if (!$response->successful()) {
                 return response()->json([
                     'success' => false,
-                    'message' => 'API /capacity/update/{id} gagal. Cek debug untuk detail error.',
-                    'debug' => [
-                        'update_url' => $updateUrl,
-                        'slot_id' => $slotId,
-                        'status' => $updateResponse->status(),
-                        'body' => $bodyText,
-                        'json' => $bodyJson,
-                    ],
+                    'message' => 'API gagal update kapasitas.',
+                    'status' => $response->status(),
+                    'body' => $response->body(),
+                    'slot_id' => $slotId
                 ], 500);
             }
 
-            if (is_array($bodyJson) && array_key_exists('success', $bodyJson) && $bodyJson['success'] === false) {
-                return response()->json([
-                    'success' => false,
-                    'message' => $bodyJson['message'] ?? 'API mengembalikan success false saat update kapasitas.',
-                    'debug' => [
-                        'update_url' => $updateUrl,
-                        'slot_id' => $slotId,
-                        'api_response' => $bodyJson,
-                    ],
-                ], 500);
-            }
+            $json = $response->json();
 
             return response()->json([
-                'success' => true,
-                'message' => is_array($bodyJson)
-                    ? ($bodyJson['message'] ?? 'Kapasitas berhasil diperbarui.')
-                    : 'Kapasitas berhasil diperbarui.',
+                'success' => $json['success'] ?? true,
+                'message' => $json['message'] ?? 'Kapasitas berhasil diperbarui.',
                 'slot_id' => $slotId,
-                'debug' => [
-                    'slots_today_url' => "{$this->apiUrl}/slots/today",
-                    'update_url' => $updateUrl,
-                    'api_response' => $bodyJson ?? $bodyText,
-                ],
+                'data' => $json
             ]);
         } catch (\Exception $e) {
-            Log::error('Error update kapasitas dari admin', [
-                'error' => $e->getMessage(),
-                'trace' => $e->getTraceAsString(),
-            ]);
-
             return response()->json([
                 'success' => false,
-                'message' => 'Terjadi error di admin: ' . $e->getMessage(),
+                'message' => 'Terjadi error di admin: ' . $e->getMessage()
             ], 500);
         }
     }
@@ -255,8 +234,8 @@ class DashboardController extends Controller
         $to = $request->to;
 
         $transactions = $this->fetchAllTransactions()->filter(function ($tx) use ($from, $to) {
-            $date = Carbon::parse($tx['created_at'])->toDateString();
-            return $date >= $from && $date <= $to;
+            $d = Carbon::parse($tx['created_at'])->toDateString();
+            return $d >= $from && $d <= $to;
         });
 
         return Pdf::loadView('exports.transactions_pdf', compact('transactions', 'from', 'to'))
@@ -269,8 +248,8 @@ class DashboardController extends Controller
         $to = $request->to;
 
         $transactions = $this->fetchAllTransactions()->filter(function ($tx) use ($from, $to) {
-            $date = Carbon::parse($tx['created_at'])->toDateString();
-            return $date >= $from && $date <= $to;
+            $d = Carbon::parse($tx['created_at'])->toDateString();
+            return $d >= $from && $d <= $to;
         });
 
         return Excel::download(
@@ -279,134 +258,84 @@ class DashboardController extends Controller
         );
     }
 
-    private function getTodaySlotWithDebug(): array
+    /**
+     * Ambil slot hari ini dari API.
+     * Support banyak bentuk response:
+     * - { data: {...} }
+     * - { slot: {...} }
+     * - { time_slot: {...} }
+     * - { today_slot: {...} }
+     * - langsung {...}
+     */
+    private function getTodaySlot()
     {
-        $url = "{$this->apiUrl}/slots/today";
-
-        $response = Http::timeout(20)
-            ->withHeaders(['Accept' => 'application/json'])
-            ->get($url);
-
-        $bodyText = $response->body();
-        $bodyJson = null;
-
         try {
-            $bodyJson = $response->json();
+            $response = Http::timeout(10)
+                ->withHeaders(['Accept' => 'application/json'])
+                ->get("{$this->apiUrl}/slots/today");
+
+            if (!$response->successful()) {
+                return null;
+            }
+
+            $json = $response->json();
+
+            if (!is_array($json)) {
+                return null;
+            }
+
+            if (isset($json['success']) && $json['success'] === false) {
+                return null;
+            }
+
+            return $json['data']
+                ?? $json['slot']
+                ?? $json['time_slot']
+                ?? $json['today_slot']
+                ?? $json;
         } catch (\Exception $e) {
-            $bodyJson = null;
+            return null;
         }
-
-        Log::info('GET slots today response', [
-            'url' => $url,
-            'status' => $response->status(),
-            'body' => $bodyText,
-        ]);
-
-        if (!$response->successful()) {
-            return [
-                'success' => false,
-                'message' => 'Gagal mengambil /slots/today dari API.',
-                'url' => $url,
-                'status' => $response->status(),
-                'body' => $bodyText,
-                'json' => $bodyJson,
-                'slot' => null,
-            ];
-        }
-
-        if (!$bodyJson || !is_array($bodyJson)) {
-            return [
-                'success' => false,
-                'message' => 'Response /slots/today bukan JSON array/object yang valid.',
-                'url' => $url,
-                'status' => $response->status(),
-                'body' => $bodyText,
-                'json' => $bodyJson,
-                'slot' => null,
-            ];
-        }
-
-        if (($bodyJson['success'] ?? true) === false) {
-            return [
-                'success' => false,
-                'message' => $bodyJson['message'] ?? 'API /slots/today mengembalikan success false.',
-                'url' => $url,
-                'status' => $response->status(),
-                'body' => $bodyText,
-                'json' => $bodyJson,
-                'slot' => null,
-            ];
-        }
-
-        $slot = $bodyJson['data']
-            ?? $bodyJson['slot']
-            ?? $bodyJson['time_slot']
-            ?? $bodyJson['todaySlot']
-            ?? $bodyJson['today_slot']
-            ?? $bodyJson;
-
-        return [
-            'success' => is_array($slot),
-            'message' => is_array($slot)
-                ? 'Slot hari ini ditemukan.'
-                : 'Slot hari ini tidak ditemukan di response API.',
-            'url' => $url,
-            'status' => $response->status(),
-            'body' => $bodyText,
-            'json' => $bodyJson,
-            'slot' => is_array($slot) ? $slot : null,
-        ];
     }
 
-    private function extractSlotId(array $slot): ?string
+    /**
+     * Ambil ID dari berbagai kemungkinan nama field.
+     */
+    private function extractSlotId(array $slot)
     {
-        $possibleKeys = [
-            '_id',
-            'id',
-            'id_time_slot',
-            'time_slot_id',
-            'slot_id',
-            'id_slot',
-            'timeSlotId',
-            'time_slotId',
-        ];
-
-        foreach ($possibleKeys as $key) {
-            if (!empty($slot[$key])) {
-                return (string) $slot[$key];
-            }
-        }
-
-        foreach ($slot as $value) {
-            if (is_array($value)) {
-                $nestedId = $this->extractSlotId($value);
-                if ($nestedId) {
-                    return $nestedId;
-                }
-            }
-        }
-
-        return null;
+        return $slot['_id']
+            ?? $slot['id']
+            ?? $slot['id_time_slot']
+            ?? $slot['time_slot_id']
+            ?? $slot['slot_id']
+            ?? null;
     }
 
+    /**
+     * Ambil semua transaksi dari API dengan pagination.
+     */
     private function fetchAllTransactions($maxPage = null)
     {
         $page = 1;
         $allData = collect();
 
         do {
-            $response = Http::timeout(10)->get("{$this->apiUrl}/transactions", [
-                'page' => $page,
-            ]);
+            try {
+                $response = Http::timeout(10)->get("{$this->apiUrl}/transactions", [
+                    'page' => $page
+                ]);
 
-            if (!$response->successful()) {
+                if (!$response->successful()) {
+                    break;
+                }
+
+                $json = $response->json();
+                $allData = $allData->merge($json['data'] ?? []);
+                $lastPage = $json['last_page'] ?? 1;
+                $page++;
+            } catch (\Exception $e) {
                 break;
             }
-
-            $json = $response->json();
-            $allData = $allData->merge($json['data'] ?? []);
-            $lastPage = $json['last_page'] ?? 1;
-            $page++;
         } while ($page <= $lastPage && ($maxPage === null || $page <= $maxPage));
 
         return $allData;
